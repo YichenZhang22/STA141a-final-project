@@ -1,0 +1,788 @@
+---
+title: "Predicting Behavioral Outcomes in Mice Using Neural Data"
+author: "Yichen Zhang"
+date: 'Mar 16, 2025'
+output:
+  html_document: 
+    toc: true
+    toc_float: 
+      collapsed: false
+      smooth_scroll: false
+    theme: cosmo
+  pdf_document: default
+---
+
+```{r packages, echo=FALSE, eval=TRUE, message=FALSE}
+
+suppressWarnings(library(tidyverse))
+suppressWarnings(library(knitr))
+suppressWarnings(library(dplyr))
+suppressWarnings(library(ggplot2))
+suppressWarnings(library(ROCR))
+suppressWarnings(library(caret))
+suppressWarnings(library(gridExtra))
+suppressWarnings(library(ggforce))
+suppressWarnings(library(xgboost))
+suppressWarnings(library(pROC))
+suppressWarnings(library(randomForest))
+suppressWarnings(library(kableExtra))
+suppressWarnings(library(plotly))
+```
+
+```{r summarize data, echo=FALSE}
+session=list()
+for(i in 1:18){
+  session[[i]]=readRDS(paste('./Data/session',i,'.rds',sep=''))
+}
+
+n.session=length(session)
+
+meta <- tibble(
+  session_num = rep(0,n.session),
+  mouse_name = rep('name',n.session),
+  date_exp =rep('dt',n.session),
+  n_brain_area = rep(0,n.session),
+  n_neurons = rep(0,n.session),
+  n_trials = rep(0,n.session),
+  success_rate = rep(0,n.session)
+)
+
+for(i in 1:n.session){
+  tmp = session[[i]];
+  meta[i,1]=i;
+  meta[i,2]=tmp$mouse_name;
+  meta[i,3]=tmp$date_exp;
+  meta[i,4]=length(unique(tmp$brain_area));
+  meta[i,5]=dim(tmp$spks[[1]])[1];
+  meta[i,6]=length(tmp$feedback_type);
+  meta[i,7]=mean(tmp$feedback_type+1)/2;
+}
+```
+
+```{r data, echo=FALSE, message=FALSE}
+get_trail_data <- function(session_id, trail_id){
+  spikes <- session[[session_id]]$spks[[trail_id]]
+  if (any(is.na(spikes))){
+    disp("value missing")
+  }
+  trail_tibble <- tibble("neuron_spike" = rowSums(spikes))  %>%  add_column("brain_area" = session[[session_id]]$brain_area ) %>% group_by(brain_area) %>% summarize( region_sum_spike = sum(neuron_spike), region_count = n(),region_mean_spike = mean(neuron_spike)) 
+  trail_tibble  = trail_tibble%>% add_column("trail_id" = trail_id) %>% add_column("contrast_left"= session[[session_id]]$contrast_left[trail_id]) %>% add_column("contrast_right"= session[[session_id]]$contrast_right[trail_id]) %>% add_column("feedback_type"= session[[session_id]]$feedback_type[trail_id])
+  trail_tibble
+}
+
+get_session_data <- function(session_id){
+  n_trail <- length(session[[session_id]]$spks)
+  trail_list <- list()
+  for (trail_id in 1:n_trail){
+    trail_tibble <- get_trail_data(session_id,trail_id)
+    trail_list[[trail_id]] <- trail_tibble
+  }
+  session_tibble <- do.call(rbind, trail_list)
+  session_tibble <- session_tibble %>% add_column("mouse_name" = session[[session_id]]$mouse_name) %>% add_column("date_exp" = session[[session_id]]$date_exp) %>% add_column("session_id" = session_id) 
+  session_tibble
+}
+
+session_list = list()
+for (session_id in 1: 18){
+  session_list[[session_id]] <- get_session_data(session_id)
+}
+full_tibble <- do.call(rbind, session_list)
+full_tibble$success <- full_tibble$feedback_type == 1
+full_tibble$success <- as.numeric(full_tibble$success)
+full_tibble$contrast_diff <- abs(full_tibble$contrast_left-full_tibble$contrast_right)
+full_tibble$success <- full_tibble$feedback_type == 1
+full_tibble$success <- as.numeric(full_tibble$success)
+```
+
+```{r spike rate data, echo=FALSE}
+binename <- paste0("bin", as.character(1:40))
+
+get_trail_functional_data <- function(session_id, trail_id){
+  spikes <- session[[session_id]]$spks[[trail_id]]
+  if (any(is.na(spikes))){
+    disp("value missing")
+  }
+
+  trail_bin_average <- matrix(colMeans(spikes), nrow = 1)
+  colnames(trail_bin_average) <- binename
+  trail_tibble  = as_tibble(trail_bin_average)%>% add_column("trail_id" = trail_id) %>% add_column("contrast_left"= session[[session_id]]$contrast_left[trail_id]) %>% add_column("contrast_right"= session[[session_id]]$contrast_right[trail_id]) %>% add_column("feedback_type"= session[[session_id]]$feedback_type[trail_id])
+  
+  trail_tibble
+}
+
+get_session_functional_data <- function(session_id){
+  n_trail <- length(session[[session_id]]$spks)
+  trail_list <- list()
+  for (trail_id in 1:n_trail){
+    trail_tibble <- get_trail_functional_data(session_id,trail_id)
+    trail_list[[trail_id]] <- trail_tibble
+  }
+  session_tibble <- as_tibble(do.call(rbind, trail_list))
+  session_tibble <- session_tibble %>% add_column("mouse_name" = session[[session_id]]$mouse_name) %>% add_column("date_exp" = session[[session_id]]$date_exp) %>% add_column("session_id" = session_id) 
+  session_tibble
+}
+
+session_list = list()
+for (session_id in 1: 18){
+  session_list[[session_id]] <- get_session_functional_data(session_id)
+}
+full_functional_tibble <- as_tibble(do.call(rbind, session_list))
+full_functional_tibble$session_id <- as.factor(full_functional_tibble$session_id )
+full_functional_tibble$contrast_diff <- abs(full_functional_tibble$contrast_left-full_functional_tibble$contrast_right)
+
+full_functional_tibble$success <- full_functional_tibble$feedback_type == 1
+full_functional_tibble$success <- as.numeric(full_functional_tibble$success)
+```
+# Abstract
+
+In this project, our goal is to analyze the neural activity and behavioral responses of mice in visual stimulation experiments. By utilizing spike training data and stimulus comparisons, I will develop predictive models to determine the outcome (success or failure) of the trials. The analysis will focus on exploring the structure of the data, integrating information from 18 sessions, and constructing accurate predictive models to achieve high performance on the test set. In addition, the test set consists of 100 randomly selected trajectories from session 1 and session 18.
+
+# Section 1: Introduction
+
+The dataset consists of 18 sessions from 4 different mice (Cori, Forssmann, Hench, and Lederberg). Each experiment recorded neural activity in different brain areas of the mice while performing a decision-making task. After each decision, they were rewarded or penalized (feedback) if they made a correct or incorrect choice.
+
+Neuroscience experiments often produce complex data sets that link neural activity to behavioral outcomes. This project investigates data from Steinmetz et al. (2019) in which mice perform decision-making tasks based on visual stimuli. During these tasks, neural activity in their visual cortex is recorded. Our goal is to analyze these data and use neural activity and visual stimuli as predictors of experimental outcomes
+
+Variables Description:
+
++ `mouse_name`:	Name of the mouse used in the session.
++ `date_exp`:	Date when the session was conducted.
++ `brain_area`:	Brain areas where neurons were recorded.
++ `spks`:	numbers of spikes of neurons in the visual cortex in time bins defined in time.
++ `time`:	Time points at which neural activity was recorded.
++ `contrast_left`:	The contrast level of the left stimulus (values: {0, 0.25, 0.5, 1}).
++ ≈:	The contrast level of the right stimulus (values: {0, 0.25, 0.5, 1}).
++ `feedback_type`:	Feedback for each trial: 1 (success) or -1 (failure), which results from: 
+
+  - When `contrast_left` > `contrast_right`: The correct choice is to turn the wheel to the right. Success (1) if the mouse turns right, failure (-1) otherwise.
+  - When `contrast_right` > `contrast_left` : The correct choice is to turn the wheel to the left. Success (1) if the mouse turns left, failure (-1) otherwise.
+  - When both `contrast_left` and `contrast_right` are zero: There is no visible stimulus, so the correct choice is to hold the wheel still. Success (1) if the mouse holds still, failure (-1) otherwise.
+  - When `contrast_left` and`contrast_right` are equal but non-zero: No clear visual bias, meaning the correct choice is random. The system randomly selects left or right (50% probability) as the correct choice.
+
+# Section 2: Exploratory Data Analysis
+## Data Structure Across Sessions:
+To begin my exploratory analysis, I created a data frame that compiles key details from all 18 sessions conducted with the four mice. This summary is presented in Table 1, where each row corresponds to an individual session.
+
+```{r data table, echo = FALSE}
+colnames(meta) <- c("Session", "Mouse Name", "Experiment Date", "Brain Areas", 
+                    "Number of Neurons", "Number of Trials", "Success Rate")
+kable(meta, format = "html",
+      caption = "Table 1: Summary of Experimental Sessions",
+      table.attr = "class='table table-striped'", digits=2,
+      col.names = c("Session", "Mouse Name", "Experiment Date", "Number of Brain Areas", 
+                    "Number of Neurons", "Number of Trials",
+                    paste0("Success Rate", footnote_marker_number(1))),
+      align = "c", escape = F) %>%
+  footnote(number = c("proportion of successful trials (feedback type is 1)"))
+```
+
+From Table 1, we can see that sessions are different in the mice used, the date of conducting experiments, number of brain areas, number of neurons, number of trials in each session, and the overall success rate. 
+
++ The `Mouse Name` column identifies which mouse participated in a given session.
++ The `Experiment Date` column records the specific date when each session was conducted.
++ The `Number of Brain Areas` column is the number of activated brain areas during decision-making in mice.
++ The `Neuron Count` column represents the total number of neurons from which spike data were collected.
++ The `Trial Count` column indicates the total number of trials completed in each session.
++ The `Success Rate` column reflects the proportion of successful trials, calculated by converting the `feedback_type` values from 1 (success) and -1 (failure) to a binary format (1 for success, 0 for failure) and then computing the mean.
+
+**Number of Neurons: ** The number of neurons recorded varies significantly across sessions, with Session 16 having the fewest neurons and Session 4 having the most (Table 1). Since the number of neurons varies, I might need to choose a summary and representative statistic of the neural data that can account for this. 
+
+**Number of Trials: ** Similarly, the number of trials per session is different. Sessions 1 and 18 have the lowest trial counts, which can be attributed to the removal of 100 trials from each for test set creation. In contrast, Session 10 has the highest number of trials, which could indicate either a longer session duration or better engagement from the mouse (Hench) during that session.
+
+```{r stimuli conditions, echo=FALSE}
+if (!is.data.frame(session_list)) {
+  data <- do.call(rbind, lapply(session_list, as.data.frame))  # Convert list to dataframe
+} else {
+  data <- session_list
+}
+
+data$contrast_left <- as.factor(data$contrast_left)
+data$contrast_right <- as.factor(data$contrast_right)
+data$mouse_name <- as.factor(data$mouse_name)
+
+# contrast_left
+ggplot(data, aes(x = contrast_left, fill = mouse_name)) +
+  geom_bar(alpha = 0.8) +
+  labs(title = "Figure 1: Distribution of Left Contrast Levels",
+       x = "Left Contrast",
+       y = "Count",
+       fill = "Mouse Name")
+ggplot(data, aes(x = contrast_left, fill = contrast_left)) +
+  geom_bar(alpha = 0.8) +
+  facet_wrap(~ mouse_name) +
+  labs(title = "Figure 2: Distribution of Left Contrast Levels Across Each Mouse",
+       x = "Right Contrast",
+       y = "Count",
+       fill = "Right Contrast")
+
+# contrast_right
+ggplot(data, aes(x = contrast_right, fill = mouse_name)) +
+  geom_bar(alpha = 0.8) +
+  labs(title = "Figure 3: Distribution of Right Contrast Levels",
+       x = "Right Contrast",
+       y = "Count",
+       fill = "Mouse Name") 
+ggplot(data, aes(x = contrast_right, fill = contrast_right)) +
+  geom_bar(alpha = 0.8) +
+  facet_wrap(~ mouse_name) +
+  labs(title = "Figure 4: Distribution of Right Contrast Levels Across Each Mouse",
+       x = "Right Contrast",
+       y = "Count",
+       fill = "Right Contrast")
+```
+
+**Stimuli Conditions: ** The bar plots above provide insights for us about the distribution of left and right contrast levels across the four mice, revealing key patterns in the data set.
+
++ The distribution of contrast levels is uneven, which has contrast level 0 (no stimulus) being the most frequent for both left and right stimuli (Figure 1, Figure 3). This suggests that many trials required the mouse to remain still, as each task design when both contrast levels were zero. Additionally, the higher contrast levels (0.25, 0.5, and 1) are less frequent but evenly distributed across sessions.
++ Cori and Forssmann had relatively fewer trials with higher contrast levels, whereas Hench and Lederberg had a more even distribution across contrast levels (Figure 2, Figure 4). This indicates that different mice might have been exposed to different experimental conditions, potentially influencing their performance.
++ Overall, the distribution of left and right contrast levels follows a similar pattern, reinforcing the balance in experimental design.
+
+**Feedback Type: ** To visualize the feedback type based on left contrast and right contrast, I utilize the contrast difference that is defined by the absolute difference between left contrast and right contrast in a visual decision-making task. 
+```{r visualize feedback_type, echo=FALSE}
+# Grouping by contrast difference and computing success rate
+contrast_summary <- full_functional_tibble %>%
+  group_by(contrast_diff) %>%
+  summarize(avg_success_rate = mean(success, na.rm = TRUE), .groups = "drop")
+
+# Visualization of contrast difference distribution
+ggplot(full_tibble, aes(x = contrast_diff, fill = factor(success))) +
+  geom_bar() +
+  labs(
+    title = "Figure 5: Distribution of Contrast Differences",
+    x = "Contrast Difference",
+    fill = "Outcome (Success = 1, Failure = 0)"
+  ) +
+  theme_bw()
+
+# Display success rate summary table
+contrast_success_rates <- full_functional_tibble %>%
+  group_by(contrast_diff) %>%
+  summarize(avg_success_rate = mean(success, na.rm = TRUE), .groups = "drop")
+
+# Computing percentage of trials for each contrast difference
+contrast_distribution <- full_functional_tibble %>%
+  count(contrast_diff) %>%
+  mutate(trial_percentage = n / sum(n),
+         percentage_label = scales::percent(trial_percentage)) %>%
+  arrange(trial_percentage)
+
+combined_contrast_table <- left_join(contrast_distribution, 
+                                     contrast_success_rates, by = "contrast_diff") %>%
+  arrange(contrast_diff)
+
+colnames(combined_contrast_table) <- c( "Contrast Difference", "Trials", "Trial Percentage",
+                                        "Percentage in %", "Avg. Success Rate")
+# Display the  table
+kable(
+  combined_contrast_table, format = "html",
+  caption = "Table 2: Contrast Difference Distribution and Success Rate",
+  table.attr = "class='table table-striped'", digits = 2
+)
+```
+
+Based on Figure 5, the higher contrast differences tend to have more success as blue bars are proportionally larger compared to the red bars. However, when contrast difference = 0, failure is more common (red bar is larger than in other groups). On Table 2, when the contrast difference is 1 (the highest), the average success rate is the highest (0.79). We can further infers that mice are easier to make correct decision when the contrast difference is higher (the stimuli is more clear), and leading to higher success rate (explain later). In contrast, mice are difficult to distinguish the correct action, and eventually results in lower success rate. So we could consider the contrast difference in predicting the feedback. Additionally, Table 2 shows that the experiment contained more trials at difficult conditions (low contrast differences), which may influence overall performance trends.
+
+**Brain Areas: ** From Table 1, we already know that the number of brain areas activated in each session ranges from 5 to 15. Now, let's take a close look on the exact locations of these brain areas.
+```{r visualize brain areas across sessions, echo=FALSE}
+ggplot(full_tibble, aes(x =session_id , y = brain_area)) +
+  geom_point() +
+  labs(x = "Sessions" , y ="Brain Areas",
+       title = "Figure 6: Activated Brain Areas Aross Sessions") +
+  scale_x_continuous(breaks = unique(full_tibble$session_id)) +  
+  theme_minimal()
+```
+
+In Figure 6, each dot represents a specific brain area that was activated during the trails in each session when the mice were making choices based on visual stimuli. There seems no pattern between the specific locations of brain areas. However, the brain areas is correlated with the neural activities because the spike of neurons is recorded in different brain areas. 
+
+## Explore the Neural Activities
+Across all 18 sessions, there were many trials, each containing data on spikes of neurons in different brain areas. The neural activity is defined as the average number of spikes of neurons in each brain area. This is determined by first summing the number of spikes per neuron, then measuring the number of spikes across neurons within the same brain area. 
+
+For analysis, session 2, trial 1 has been selected, and the table below presents the average spike count across the five distinct brain areas in this trial.
+```{r spike rate, echo=FALSE}
+i.s=2
+i.t=1
+spk.trial = session[[i.s]]$spks[[i.t]]
+area=session[[i.s]]$brain_area
+
+spk.count=apply(spk.trial,1,sum)
+spk.average.tapply=tapply(spk.count, area, mean)
+tmp <- data.frame(
+  area = area,
+  spikes = spk.count
+)
+
+spk.average.dplyr =tmp %>%
+  group_by(area) %>%
+  summarize(mean= mean(spikes))
+
+average_spike_area<-function(i.t,this_session){
+  spk.trial = this_session$spks[[i.t]]
+  area= this_session$brain_area
+  spk.count=apply(spk.trial,1,sum)
+  spk.average.tapply=tapply(spk.count, area, mean)
+  return(spk.average.tapply)
+  }
+
+kable(average_spike_area(1,this_session = session[[i.s]]), 
+      caption = "Table 3: Average Number of Spikes of Neuron in Session 2, Trial 1", 
+      table.attr = "class='table table-striped'", digits=4,
+      col.names = c("Brain Area", "Average Number of Spikes"),
+      align = "c")
+```
+
+Table 3 illustrates that the average number of spikes varies across different brain areas within a single trial. The number of spikes in each brain area is around 1 to 2. Now, we can investigate whether there is a pattern emerges across all trials in each session. To do this, I chose to include the average number of spikes of neurons in each of the 40 time bins as neural activity to analyze. I named it as the average spike rate.
+
+```{r visulize average spike rate, echo=FALSE}
+column_names <- names(full_functional_tibble)
+region_sum_columns <- column_names[grep("^region_sum", column_names)]
+region_mean_columns <- column_names[grep("^region_mean", column_names)]
+
+spike_average <- full_tibble %>%
+  group_by(session_id, trail_id) %>%
+  summarise(avg_spike_rate = sum(region_sum_spike) / sum(region_count), .groups = "drop")
+
+spike_average <- spike_average %>%
+  mutate(
+    mouse_id = full_functional_tibble$mouse_name,
+    contrast_level = full_functional_tibble$contrast_diff,
+    performance = full_functional_tibble$success
+  )
+
+ggplot(spike_average, aes(x = trail_id, y = avg_spike_rate)) +
+  geom_line(color = "black") +  
+  geom_smooth(method = "loess", color = "blue") +  
+  facet_wrap(~session_id) +  
+  labs(title = "Figure 7: Average Spike Rate Over Trials",
+       x = "Trial Number",
+       y = "Average Spike Rate")
+
+ggplot(spike_average, aes(x = trail_id, y = avg_spike_rate)) +
+  geom_line(color = "black") +  
+  geom_smooth(method = "loess", color = "blue") +  
+  facet_wrap(~mouse_id) +  
+  labs(title = "Figure 8: Average Spike Rate for Each Mouse",
+       x = "Trial Number",
+       y = "Average Spike Rate")
+```
+
+Figure 7 displays the average spike rate over trials for each session. Since the blue smoothing curve trends downward, the average spike rate is decreasing across sessions, with some sessions showing an initial increase before declining (e.g., session 1 and 7). This suggests that neural activity is higher at the beginning of a session but tends to decrease as trials progress.
+Figure 8 summarizes the session-level trends by aggregating data for each mouse. Since each mouse corresponds to multiple sessions, the mouse-level trends reflect session-level patterns. All four mice show a progressive decline in average spike rate, though with some individual variation:
+
++ Cori and Forssmann exhibit a sharper decline in neural activity, suggesting either faster adaptation or greater fatigue.
++ Hench and Lederberg display a more gradual decrease in neural activity, indicating sustained neural engagement over trials.
+
+Overall, the average spike rate tends to decrease as trials progress.
+
+
+## Explore the Changes Across Trials
+### Change in Success Rate 
+```{r success rate, echo=FALSE}
+ggplot(meta, aes(x = Session, y = `Success Rate`, fill = `Mouse Name`)) +
+  geom_bar(stat = "identity", color = "black", alpha = 0.7) +
+  labs(title = "Figure 9: Success Rate Across Each Session",
+       x = "Session",
+       y = "Success Rate") +
+  scale_x_continuous(breaks = unique(meta$Session), labels = unique(meta$Session))
+```
+
+According to Figure 9, the success rate varies across sessions but generally shows an upward trend over time, indicating that mice may have improved their performance as they gained more experience with the task. Additionally, the number of sessions is not evenly distributed among the four mice. Cori participated in only three sessions (Sessions 1–3), while Lederberg completed seven sessions (Sessions 12–18). This imbalance implies that both session number and mouse identity may be important factors to consider in predictive modeling, as certain mice have more data available for analysis than others.
+
+In addition, we can take a close look on the success rate over trials and mice. 
+```{r visualize success rate, echo=FALSE}
+full_tibble$trail_group = cut(full_tibble$trail_id, breaks = seq(0, max(full_tibble$trail_id), by = 25),include.lowest = TRUE)
+levels(full_tibble$trail_group) <- seq(0, max(full_tibble$trail_id), by = 25)[2:18]
+
+success_rate <- aggregate(success ~ session_id + trail_group, data = full_tibble, FUN = function(x) mean(x) )
+ggplot(success_rate, aes(x = trail_group, y = success)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Figure 10: Success Rate Over Trials",
+       x = "Trial",
+       y = "Success Rate") +
+  facet_wrap(~session_id, ncol=3) +
+      theme_bw()
+```
+
+In Figure 10, we can see that the success rate appears to peak at some point and then decrease toward the end of trials in each session. This might be due to mice become physically or mentally exhausted as trials progress. In addition to fatigue, another reason for memory loss may be reduced motivation or disengagement from tasks after trial and error. If the task becomes repetitive or unrewarding, the mouse may use less effort to complete it.
+
+```{r visualize success rate across mice, echo=FALSE}
+full_functional_tibble$trail_group = cut(full_functional_tibble$trail_id, breaks = seq(0, max(full_functional_tibble$trail_id), by = 25),include.lowest = TRUE)
+levels(full_functional_tibble$trail_group) <- seq(0, max(full_functional_tibble$trail_id), by = 25)[2:18]
+success_rate_mouse <- aggregate(success ~ + trail_group + mouse_name, data = full_functional_tibble, FUN = function(x) mean(x) )
+
+ggplot(success_rate_mouse, aes(x = trail_group, y = success, group = mouse_name)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Figure 11: Success Rate Over Mouse",
+       x = "Trial",
+       y = "Success Rate") +
+  facet_wrap(~mouse_name) +
+      theme_bw()
+```
+
+Figure 11 reveals the success rate of each mouse is mostly decreasing at the end of trials, suggesting that there is a similar pattern between success rate graphs (Figure 10 & Figure 11) for different session and mice. In addition, the average spike rate (Figures 7 and 8) is strongly correlated with the change in success rate, which decreases across different sessions. Furthermore, since each mouse is associated with multiple trials, and the success rate patterns are largely consistent across trials for the same mouse. So we can avoid the redundancy by considering session in the data integration and disregarding the mouse name because they overlap information. I will further explain this in the data integration.
+
+## Explore Homogeneity and Heterogeneity Across Sessions and Mice
+### Homogeneity
+Homogeneity suggests that patterns remain stable regardless of the session or the mouse:
+
+  + Both "Figure 10: Success Rate Over Trials" and "Figure 11: Success Rate Over Mouse" shows a general decline of success rate in later trials, indicating a common trend. Since each mouse is associated with multiple sessions, the session-based analysis captures most of the variance in success rate.
+  + The neural activity (spike rate) follows a similar trend across trials (Figure 7 & Figure 8). The average spike rate decreases over trials, aligning with the success rate decline. This suggests that neural activity and task performance are closely linked across both sessions and mice.
+  + Since each mouse contributes to multiple sessions, the data exhibits high similarity between session and mouse patterns. This indicates that session-based grouping may be sufficient, and mouse identity may not add significant new information in data integration.
+
+### Heterogeneity
+Despite overall similarities, some variations exist between sessions and mice, suggesting heterogeneity:
+
+  + Some mice (Cori and Forssmann) show steeper declines in average spike rate in Figure 8, while others (Hench and Lederberg) maintain more stable activity. This highlights individual differences in learning, fatigue, or engagement levels.
+  + Some sessions display a steady decline in success rate (Figure 10), while others exhibit fluctuations, possibly due to external factors such as trial difficulty or mouse motivation.
+  + Figure6 illustrates that different sessions engage distinct neural circuits, highlighting session-dependent neural dynamics. The variation in activated brain areas reflects that neural engagement is dynamic rather than static, possibly adapting based on experience, task demands, or learning processes. Given that each mouse experiences multiple sessions, the activation patterns in brain areas differ across individuals. This may indicate individual differences in neural processing, learning capacity, or even behavioral strategies.
+
+Given the strong within-group homogeneity but some between-group heterogeneity, we may focus on session-level analysis rather than mouse-level analysis, as session trends already capture individual mouse behavior.
+
+# Section 3 Data integration
+## Dimension Reduction through PCA
+Since our data set contains high-dimensional neural and behavioral data (e.g., average spike rate), it is crucial to reduce dimensionality to handle the data efficiently, and enhance our predictive modeling. To reduce the dimension of our data, we can utilize the Principle Component Analysis (PCA).
+```{r dimension reduction, echo = FALSE}
+features = full_functional_tibble[,1:44]
+scaled_features <- scale(features)
+pca_result <- prcomp(scaled_features)
+pc_df <- as.data.frame(pca_result$x)
+pc_df$session_id <- full_functional_tibble$session_id
+pc_df$mouse_name <- full_functional_tibble$mouse_name
+
+plot(pca_result,type="l", main = "Figure 12: Scree Plot")
+```
+
+According to Figure 12, PC1 captures the largest variance, with a sharp decline after the first few components. The "elbow point" suggests that the variance explained by additional PCs is minimal after PC2, forming a nearly flat line. The sharp decline between PC1 and PC2 suggests that most of the variability in the dataset is captured by the first few PCs. In addition, the variance levels off after PC3, indicating that additional PCs contribute little new information. So we can use PC1 and PC2 for analysis and modeling, which they retain the most important features while eliminating redundant information.
+
+```{r visualize PCs, echo = FALSE}
+ggplot(pc_df, aes(x = PC1, y = PC2, color = session_id)) +
+  geom_point() +
+  labs(title = "Figure 13: PC1 vs PC2 (colored by session)")
+
+ggplot(pc_df, aes(x = PC1, y = PC2, color = mouse_name)) +
+  geom_point() +
+  labs(title = "Figure 14: PC1 vs PC2 (colored by mouse)")
+```
+
+In Figure 13, different sessions show some degree of overlap in PC1-PC2 space, suggesting shared patterns across sessions. In addition, data points from different mice strongly overlap (Figure 14), indicating that despite individual differences, neural activity and behavioral patterns are largely consistent across mice. Comparing these two scatter plots, it seems like there are similar pattern between PCA scatter plots for different session and mouse, which further revels the homogeneity across session and mouse.
+
+## Feature Selection
+After visualizing the 2D results of PCA, I decide to utilize trials from all sessions to evaluate performance. Based on my exploratory data analysis, the important features to include in the predictive model are `session_id`, `trial_id`, neural signals (e.g., `contrast_left`, `contrast_right`, and `contrast_diff`), and the average spike rate for each time bin. The first six columns of the selected features is printed below.
+```{r dataframe to predict, echo=FALSE}
+predictive_feature <- c("session_id","trail_id","contrast_right","contrast_left", "contrast_diff" ,binename)
+head(full_functional_tibble[predictive_feature])
+```
+
+```{r create predictor matrix X, echo=FALSE}
+predictive_dat <- full_functional_tibble[predictive_feature]
+predictive_dat$trail_id <- as.numeric(predictive_dat$trail_id)
+label <- as.numeric(full_functional_tibble$success)
+X <- model.matrix(~., predictive_dat)
+```
+
+# Section 4 Predictive modeling
+In this section, we aim to build a predictive model to classify outcomes (feedback_type: success = 1 & failure = 0) based on selected features from data integration section. The process includes splitting the data set into training and testing sets, training in two classification methods (**XGBoost Model** & **Logistic Regression Model**), evaluating the model’s performance, and visualizing the results.
+
+**Data Splitting and Preparation: **
+Before training the model, the data set created in data integration is split into training (80%) and testing (20%) subsets to ensure that the model is evaluated on unseen data, which ensuring a fair assessment of its performance.
+```{r 80% trails model train, echo=FALSE}
+# split
+set.seed(123) # for reproducibility
+trainIndex <- createDataPartition(label, p = .8, 
+                                  list = FALSE, 
+                                  times = 1)
+train_df <- predictive_dat[trainIndex, ]
+train_X <- X[trainIndex,]
+test_df <- predictive_dat[-trainIndex, ]
+test_X <- X[-trainIndex,]
+
+train_label <- label[trainIndex]
+test_label <- label[-trainIndex]
+```
+
+## XGBoost Model
+```{r XGBoost model, echo=FALSE}
+set.seed(123)
+xgb_model <- xgboost(data = train_X, label = train_label, objective = "binary:logistic", nrounds=10)
+pred_xgb <- predict(xgb_model, newdata = test_X)
+predicted_labels <- as.numeric(ifelse(pred_xgb > 0.5, 1, 0))
+accuracy <- mean(predicted_labels == test_label)
+
+# confusion matrix
+conf_matrix <- confusionMatrix(as.factor(predicted_labels), as.factor(test_label))
+
+# report performance
+error_rate <- 1 - accuracy
+cat("Accuracy of XGBoost Model:", accuracy,'\n')
+cat("Misclassification Error Rate:", error_rate)
+```
+
+The first part of the output above shows the training log loss for each iteration. Log loss is a measure of how well the model's predicted probabilities match the true labels, with lower values indicating better performance. Initially, the log loss starts at 0.6016 and gradually decreases after 10 rounds of boosting, reaching 0.3929 at the final iteration. This steady decrease indicates that our XGBoost model is effectively learning from the training data and improving its classification accuracy through iterations. The model's accuracy is 73.13%, meaning it correctly classifies 73.13% of test samples. The accuracy also infers that the misclassification error rate is about 26.87%.
+
+```{r visualize xgboost model, echo=FALSE}
+plot.xg <- as.data.frame(conf_matrix$table)
+ggplot(plot.xg, aes(Reference, Prediction, fill= Freq)) +
+        geom_tile() + geom_text(aes(label=Freq)) +
+        scale_fill_gradient(low="white", high="pink") +
+        labs(x = "Reference",y = "Prediction",
+             title = "Figure 15: XGBoost Model Confusion Matrix Heatmap") +
+        scale_x_discrete(labels=c("0","1")) +
+        scale_y_discrete(labels=c("0","1"))
+```
+
+Figure 15 is a visualization of our confusion matrix result that represents the frequency of correct and incorrect predictions. The darker pink shades indicate higher value, highlighting that the XGBoost model correctly classifies 76 failures (true negatives) and 667 successes (true positives). However, the white part shows that the model misclassifies 52 actual successes as failures (false negatives) and 221 actual failures as successes (false positives). This suggesting that the XGBoost model is better at identifying successes than failures.
+
+## Logistic Regression Model
+Another classification method I used to build a predictive model is logistic regression. I fit the same variables from the XGBoost model and check if it will have a better performance. The performance of the model is assessed using accuracy, error rate, and a confusion matrix.
+```{r logistic regression model, echo=FALSE}
+set.seed(123)
+predictive_feature_log <- c("session_id","trail_id","contrast_right","contrast_left", "contrast_diff" ,binename, "success")
+
+predictive_dat_log <- full_functional_tibble[predictive_feature_log]
+
+predictive_dat_log$trail_id <- as.numeric(predictive_dat_log$trail_id)
+predictive_dat_log$success <- as.numeric(predictive_dat_log$success)
+
+trainIndex_log <- createDataPartition(predictive_dat_log$success, p = 0.8,list = FALSE)
+train_df_log <- predictive_dat_log[trainIndex_log, ]
+test_df_log <- predictive_dat_log[-trainIndex_log, ]
+```
+
+```{r echo=FALSE}
+set.seed(123)
+fit1 <- glm(success ~ .,data = train_df_log, family="binomial")
+
+# prediction
+pred_log <- predict(fit1, newdata=test_df_log, type = 'response')
+prediction_log <- factor(pred_log > 0.5, labels = c('0', '1'))
+error_rate_log = mean(prediction_log != test_df_log$success)
+cat("The prediction error is", error_rate_log,"\n")
+accuracy_log = 1 - error_rate_log
+cat("The model accuracy is", accuracy_log, "\n")
+
+# confusion matrix
+conf_matrix_log <- confusionMatrix(prediction_log, as.factor(test_df_log$success), dnn = c("Prediction", "Reference"))
+
+plot_log <- as.data.frame(conf_matrix_log$table)
+
+ggplot(plot_log, aes(Reference, Prediction, fill= Freq)) +
+        geom_tile() + geom_text(aes(label=Freq)) +
+        scale_fill_gradient(low="white", high="pink") +
+        labs(x = "Reference",y = "Prediction", 
+             title = "Figure 16: Logistic Regression Model Confusion Matrix Heatmap") +
+        scale_x_discrete(labels=c("0","1")) +
+        scale_y_discrete(labels=c("0","1"))
+```
+
+Based on the result of evaluation, the logistic regression model's prediction error is 0.2785, meaning that approximately 27.85% of the predictions were incorrect. In addition, the model accuracy is 72.15%, indicating that the model correctly classified 72.15% of the test data. These results suggest that the logistic regression model has moderate predictive performance, but there may be room for improvement.
+Furthermore, the darker pink in Figure 16 represents higher values, highlighting the large number of true positives (673) and false positives (237). And the white portion shows that there are small number of true negatives (60) and false negatives (46). On other words, the model correctly identified 673 success (true positives) and 60 failures (true negative). However, it misclassified 237 failures as successes, and 46 successes as failures. These results indicated that the model is better at classifying success (feedback_type = 1) than failure.
+
+## ROC Curves
+```{r roc curves, echo=FALSE}
+# auc for xgboost
+pr1 = prediction(pred_xgb, test_label)
+prf <- performance(pr1, measure = "tpr", x.measure = "fpr")
+auc1 <- performance(pr1, measure = "auc")
+auc1 <- auc1@y.values[[1]]
+
+# auc for logistic
+pr2 = prediction(pred_log, test_df_log$success)
+prf2 <- performance(pr2, measure = "tpr", x.measure = "fpr")
+auc2 <- performance(pr2, measure = "auc")
+auc2 <- auc2@y.values[[1]]
+
+# bias guess
+pred0 = pred_xgb * 0 + 1
+pr = prediction(pred0, test_label)
+prf0 <- performance(pr, measure = "tpr", x.measure = "fpr")
+auc0 <- performance(pr, measure = "auc")
+auc0 <- auc0@y.values[[1]]
+
+cat("The AUC for the XGBoost model is", auc1,"\n")
+cat("The AUC for the logistic regression model is", auc2,"\n")
+
+roc_data_logistic <- roc(test_df_log$success, pred_log)
+roc_data_xgb <- roc(test_label, pred_xgb)
+
+plot(prf2, col = "blue", lwd = 2, 
+     main = "Figure 17: ROC Curves for Logistic Regression and XGBoost Models")
+plot(prf, add=TRUE, col = "red", lwd = 2)
+plot(prf0, add = TRUE, col = 'black')
+legend("bottomright", legend = c("Logistic Regression", "XGBoost", "Bias Guess"),
+       col = c("blue", "red", "black"), lty = 1:1, cex = 0.8)
+```
+
+The Receiver Operating Characteristics (ROC) curves shown in Figure 17 compare the performance of the Logistic regression model (blue) and the XGBoost model (red) in distinguishing between successful and unsuccessful outcomes. The Bias Guess line (black diagonal) indicates a random guess, which results in an AUC of 0.5. We can see that the XGBoost curve (red) is above the Logistic Regression curve (blue), and the AUC values for XGBoost model is 0.7379, and Logistic regression AUC is 0.7137. These results confirm that XGBoost model has a slightly stronger classification ability than Logistic regression model. Furthermore, both models perform significantly better than random guessing, as they are well above the Bias Guess (black diagonal line). 
+
+# Section 5 Prediction performance on the test sets
+To evaluate the performance of my XGBoost model on the test sets, I will use the test data which is randomly selected two sets of 100 trials from Session 1 and Session 18. I will assess performance using  accuracy and the area under ROC curve to determine how well the model makes correct predictions.
+```{r get test data, echo=FALSE}
+test=list()
+for(i in 1:2){
+  test[[i]]=readRDS(paste('./TestData/test',i,'.rds',sep=''))
+}
+
+test_trail_data <- function(session_id, trail_id){
+  spikes <- test[[session_id]]$spks[[trail_id]]
+  if (any(is.na(spikes))){
+    disp("value missing")
+  }
+  trail_tibble <- tibble("neuron_spike" = rowSums(spikes))  %>%  add_column("brain_area" = test[[session_id]]$brain_area ) %>% group_by(brain_area) %>% summarize( region_sum_spike = sum(neuron_spike), region_count = n(),region_mean_spike = mean(neuron_spike)) 
+  trail_tibble  = trail_tibble%>% add_column("trail_id" = trail_id) %>% add_column("contrast_left"= test[[session_id]]$contrast_left[trail_id]) %>% add_column("contrast_right"= test[[session_id]]$contrast_right[trail_id]) %>% add_column("feedback_type"= test[[session_id]]$feedback_type[trail_id])
+  trail_tibble
+}
+
+test_session_data <- function(session_id){
+  n_trail <- length(test[[session_id]]$spks)
+  trail_list <- list()
+  for (trail_id in 1:n_trail){
+    trail_tibble <- test_trail_data(session_id,trail_id)
+    trail_list[[trail_id]] <- trail_tibble
+  }
+  session_tibble <- do.call(rbind, trail_list)
+  session_tibble <- session_tibble %>% add_column("mouse_name" = test[[session_id]]$mouse_name) %>% add_column("date_exp" = test[[session_id]]$date_exp) %>% add_column("session_id" = session_id) 
+  session_tibble
+}
+
+test_list = list()
+for (session_id in 1:2){
+  test_list[[session_id]] <- test_session_data(session_id)
+}
+test_tibble <- do.call(rbind, test_list)
+test_tibble$success <- test_tibble$feedback_type == 1
+test_tibble$success <- as.numeric(test_tibble$success)
+test_tibble$contrast_diff <- abs(test_tibble$contrast_left-test_tibble$contrast_right)
+```
+
+```{r get functional test data, echo=FALSE}
+binename <- paste0("bin", as.character(1:40))
+
+test_trail_functional_data <- function(session_id, trail_id){
+  spikes <- test[[session_id]]$spks[[trail_id]]
+  if (any(is.na(spikes))){
+    disp("value missing")
+  }
+
+  trail_bin_average <- matrix(colMeans(spikes), nrow = 1)
+  colnames(trail_bin_average) <- binename
+  trail_tibble  = as_tibble(trail_bin_average)%>%
+    add_column("trail_id" = trail_id) %>%
+    add_column("contrast_left"= test[[session_id]]$contrast_left[trail_id]) %>%
+    add_column("contrast_right"= test[[session_id]]$contrast_right[trail_id]) %>%
+    add_column("feedback_type"= test[[session_id]]$feedback_type[trail_id])
+  
+  trail_tibble
+}
+
+test_session_functional_data <- function(session_id){
+  n_trail <- length(test[[session_id]]$spks)
+  trail_list <- list()
+  for (trail_id in 1:n_trail){
+    trail_tibble <- test_trail_functional_data(session_id,trail_id)
+    trail_list[[trail_id]] <- trail_tibble
+  }
+  session_tibble <- as_tibble(do.call(rbind, trail_list))
+  session_tibble <- session_tibble %>% add_column("mouse_name" = test[[session_id]]$mouse_name) %>% add_column("date_exp" = test[[session_id]]$date_exp) %>% add_column("session_id" = session_id) 
+  session_tibble
+}
+
+test_list = list()
+for (session_id in 1:2){
+  test_list[[session_id]] <- test_session_functional_data(session_id)
+}
+test_functional_tibble <- as_tibble(do.call(rbind, test_list))
+test_functional_tibble$session_id <- factor(test_functional_tibble$session_id, levels = levels(full_functional_tibble$session_id))
+test_functional_tibble$contrast_diff <- abs(test_functional_tibble$contrast_left-test_functional_tibble$contrast_right)
+
+test_functional_tibble$success <- test_functional_tibble$feedback_type == 1
+test_functional_tibble$success <- as.numeric(test_functional_tibble$success)
+```
+
+## Model Performance on Test Data from Session 1
+```{r test data 1, echo=FALSE}
+test_1 <- test_functional_tibble %>% filter (session_id==1) 
+predictive_feature <- c("session_id","trail_id","contrast_right","contrast_left", "contrast_diff" ,binename)
+predictive_data1 <- test_1[predictive_feature]
+predictive_data1$trail_id <- as.numeric(predictive_data1$trail_id)
+label1 <- as.numeric(test_1$success)
+X1 <- model.matrix(~., predictive_data1)
+```
+
+```{r performance on test1, echo=FALSE}
+set.seed(123)
+pred_xgb1 <- predict(xgb_model, newdata=X1, type='response')
+predicted_label1 <- as.numeric(ifelse(pred_xgb1 > 0.5, 1, 0))
+accuracy1 <- mean(predicted_label1 == label1)
+
+#auc
+pr3 = prediction(pred_xgb1, label1)
+prf3 <- performance(pr3, measure = "tpr", x.measure = "fpr")
+auc3 <- performance(pr3, measure = "auc")
+auc3 <- auc3@y.values[[1]]
+
+# report performance
+cat("Accuracy of XGBoost Model on test data from Session 1:", accuracy1,'\n')
+cat("AUC:", auc3,'\n')
+```
+
+Based on the result, my XGBoost model has accuracy of 74% and the area under ROC curve of 0.7004 on the test data from Session 1. Comparing to the model's overall predictive performance (accuracy = 73.13%, auc =0.7379), the accuracy on test data from session 1 is increased, while the area under ROC curve is lower So, the XGBoost model seems to be appropriate to predict the outcome (feedback) of mice.
+
+## Model Performance on Test Data from Session 18
+```{r test data 2, echo=FALSE}
+test_2 <- test_functional_tibble %>% filter (session_id==2) 
+predictive_feature <- c("session_id","trail_id","contrast_right","contrast_left", "contrast_diff" ,binename)
+predictive_data2 <- test_2[predictive_feature]
+predictive_data2$trail_id <- as.numeric(predictive_data2$trail_id)
+label2 <- as.numeric(test_2$success)
+X2 <- model.matrix(~., predictive_data2)
+```
+
+```{r performance on test2, echo=FALSE}
+set.seed(123)
+pred_xgb2 <- predict(xgb_model, newdata=X2, type='response')
+predicted_label2 <- as.numeric(ifelse(pred_xgb2 > 0.5, 1, 0))
+accuracy2 <- mean(predicted_label2 == label2)
+
+#auc
+pr4 = prediction(pred_xgb2, label2)
+prf4 <- performance(pr4, measure = "tpr", x.measure = "fpr")
+auc4 <- performance(pr4, measure = "auc")
+auc4 <- auc4@y.values[[1]]
+
+# report performance
+cat("Accuracy of XGBoost Model on test data from Session 18:", accuracy2,'\n')
+cat("AUC:", auc4,'\n')
+```
+
+From the results, both the accuracy (72%) and the area under ROC curve (0.6646) are a bit lower than the model's overall predictive performance. The XGBoost model's performance declines on the test data from session 18. This suggests that the XGBoost model had more difficulty processing the data in session 18, indicating its ability to generalize across sessions may be limited. 
+
+Overall, the XGBoost model was quite effective in predicting feedback, but further improvements may be needed to ensure consistent performance across different sessions.
+
+# Section 6 Discussion
+
+From my initial exploration data analysis, I was interested in focusing on neural analysis primarily through stimulus conditioning, average spike rates, and time bins. Based on my data integration, I finally obtained the key predictors including `session_id`, `trial_id`, neural signals (e.g., `contrast_left`, `contrast_right`, and `contrast_diff`), and the average spike rate for each time bin. As the contrast difference increases, the mice are more likely to give a successful feedback. Additionally, as the average spiking rate in specific brain regions increased, the success rate of the mice increased accordingly. Finally, the number of session and the number of trials are key predictors, because there may be a willingness to complete the task at different stages for each mouse. In contrast, the decrease in success rate in later trials may be due to the fact that the mice were tired, thus decreasing their willingness to participate. 
+
+In order to construct a binary categorical predictive model, I chose to try logistic regression and XGBoost. By comparing the performance of these two models through the highest accuracy and auc values, I ultimately resulted in a XGBoost model. However, it seems that the performance of this model declined on the unseen data, which is to be expected, but could be improved. Therefore, there are some limitations to my analysis that I can explore for potential improvements in the future.
+
+Limitations:
+
++ Although the dataset consisted of 18 sessions, the amount of data available varied from mouse to mouse. For example, some mice (e.g., Cori) have relatively few trials, which may limit the model's ability to capture their behavioral patterns. Expanding the data set might be helpful to improve my model.
++ My model does not fully utilize brain region activity to predict mouse's responses. Although my EDA showed a weak correlation between brain activity and success rates, this may be due to the feature extraction methods is not appropriate by using average spike rates.
++ In the future, I could explore more sophisticated feature extraction techniques, such as time series analysis or functional data analysis, to find out the dynamic patterns of brain activity.
+
+# Reference {-}
+
+Steinmetz, N.A., Zatka-Haas, P., Carandini, M. et al. Distributed coding of choice, action and engagement across the mouse brain. Nature 576, 266–273 (2019). https://doi.org/10.1038/s41586-019-1787-x
+
+# Acknowledgements  
+
+I have looked on the Professor's and TAs' notes, and students' project on Github
+
+# Appendix
+\hrulefill
+
+```{=tex}
+\begin{center} Appendix: R Script \end{center}
+```
+```{r, ref.label=knitr::all_labels(),echo=TRUE,eval=FALSE}
+```
+
